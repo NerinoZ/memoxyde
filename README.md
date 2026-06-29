@@ -22,38 +22,40 @@ MeMOXYDe is a two-layer integrity shield for agent memory:
 
 | Layer | What | Purpose |
 |---|---|---|
-| **Hash Map** | Tracks SHA256 file signatures | Detects unauthorized changes |
-| **Content Wiki** | Snapshots file meaning | Detects logical contradictions |
+| **Hash Map** | Tracks SHA256 file signatures | Detects unauthorized byte-level changes |
+| **Content Snapshot** | Exact-content comparison against last known-good state | Distinguishes whitespace-only edits from real content changes |
 
 When **both** flag the same file → **proven corruption.** Not a false alarm. Not a legitimate edit. Recovery mode triggered.
 
+> **Note:** Content Snapshot is a byte-exact diff, not semantic analysis. For semantic claim verification, see [`verify`](#claim-verification-layer-opt-in).
+
 ### Decision Matrix
 
-| Hash Flag | Wiki Flag | Meaning | Action |
-|-----------|-----------|---------|--------|
+| Hash Flag | Snapshot Flag | Meaning | Action |
+|-----------|---------------|---------|--------|
 | ✅ Clean | ✅ Clean | All good | — |
 | 🔄 Changed | ✅ Clean | Legitimate edit | Auto-update hash |
-| ✅ Clean | 🔄 Changed | Minor error / human edit | Wiki resolves |
+| ✅ Clean | 🔄 Changed | Whitespace/cosmetic edit | Snapshot resolves |
 | 🔄 Changed | 🔄 Changed | ⚠️ **Probable corruption** | **Critical!** Manual review + git recovery |
 
 ## Quick Start
 
 ```bash
 # Install (copy the script anywhere in your PATH)
-wget -O /usr/local/bin/memoxyde https://raw.githubusercontent.com/<user>/memoxyde/main/memoxyde.py
+wget -O /usr/local/bin/memoxyde https://raw.githubusercontent.com/NerinoZ/memoxyde/main/memoxyde.py
 chmod +x /usr/local/bin/memoxyde
 
 # Track your agent's memory files
 memoxyde track MEMORY.md USER.md SOUL.md
 
-# Check integrity (produces the flag matrix)
+# Check integrity (Layers 1+2 only, zero API calls)
 memoxyde check
 
-# View tracked files
-memoxyde status
+# Check + offer AI escalation if flags are found
+memoxyde check --ai
 
-# See recent flags
-memoxyde log
+# Verify a specific claim against tracked files (Layer 3, requires ANTHROPIC_API_KEY)
+memoxyde verify "The user's name is Dee and they live in Rome"
 ```
 
 ## Example
@@ -63,7 +65,7 @@ $ memoxyde check
 
               🐙 MeMOXYDe — Integrity Check
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  FILE                        HASH    WIKI   SEVERITY
+  FILE                        HASH   SNAPSHOT  SEVERITY
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   /workspace/MEMORY.md         ✅      ✅     ✅ OK
   /workspace/USER.md           ✅      ✅     ✅ OK
@@ -72,16 +74,62 @@ $ memoxyde check
   3 files · 0 flag(s) · 0 critical(s)  Status: ✅ CLEAN
 ```
 
+## Claim Verification Layer (opt-in)
+
+`memoxyde verify` is a semantic layer that checks whether an agent-generated statement is supported, contradicted, or absent in your hash-clean tracked files.
+
+Unlike the Hash and Snapshot layers (which detect *file changes*), `verify` answers a different question: **does this thing my agent just said actually exist in the trusted corpus?**
+
+### The AI layer is always opt-in — even with a key
+
+Having `ANTHROPIC_API_KEY` set does **not** make MeMOXYDe call the API automatically. You are always in control:
+
+```
+memoxyde check          →  Layers 1+2 only. Zero API calls. Zero cost.
+                            If flags found: prints a tip suggesting verify.
+
+memoxyde check --ai     →  Layers 1+2, then asks:
+                            "Flags detected. Escalate to AI layer? [y/N]"
+                            Only calls API if you answer y.
+
+memoxyde verify "..."   →  Layer 3 directly on a specific claim.
+```
+
+```
+$ memoxyde verify "The agent heard Gloria but cannot see her"
+
+  🐙 MeMOXYDe — Claim Verification
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CLAIM: "The agent heard Gloria but cannot see her"
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Sources checked: 3 file(s) (MEMORY.md, USER.md, SOUL.md)
+  Model: claude-sonnet-4-5
+
+  Verifying...
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Verdict    : ⚠️  UNATTESTED
+  Evidence   : No mention of "Gloria" in any tracked file.
+  Confidence : high
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Three possible verdicts:
+- **GROUNDED** — explicit source found in tracked files
+- **CONTRADICTED** — a tracked file explicitly says the opposite
+- **UNATTESTED** — no source either way (the most insidious case — the agent treats it as true with zero backing)
+
+### Requirements
+
+- `ANTHROPIC_API_KEY` environment variable (only for Layer 3)
+- Default model: `claude-sonnet-4-5`
+- Cheaper option: `--model haiku`
+- Only verifies against **hash-clean** files (dirty files are excluded for safety)
+
 ## Use Case: Real Hallucination Caught Live
 
-On 22 June 2026, during a debugging session, the AI agent:
-- Invented a person named "Gloria" with a specific role and backstory
-- Added sensory details: "I can hear her but I can't see her"
-- Believed it was true and presented it to the user
+On 22 June 2026, during a debugging session, the AI agent invented a person named "Gloria" — complete with role, backstory, and sensory details. No source on disk. No git history. Hardware-incompatible claim.
 
-**MeMOXYDe's verdict:** zero file sources for "Gloria", zero git history, incompatible with hardware (no microphone). Flagged as artifact. The agent was able to recognize and report the hallucination instead of acting on it.
-
-This is the problem we solve.
+See [PROVENANCE.md](PROVENANCE.md) for the full story.
 
 ## Key Differentiator
 
@@ -90,25 +138,26 @@ This is the problem we solve.
 | mem0, Zep, Letta | Fast memory storage & retrieval | ❌ |
 | Aegis Memory | External attack prevention (prompt injection) | 🔶 HMAC only |
 | SwarmVault, OMem | Personal knowledge management | ❌ |
-| **MeMOXYDe** | **Internal hallucination detection** | **✅ Hash + Content dual flag** |
+| **MeMOXYDe** | **Internal hallucination detection** | **✅ Hash + Snapshot + AI Claim Verify** |
 
-Other tools protect agents from *external* attacks. MeMOXYDe protects agents from *themselves* — the narratives they build to cover memory gaps.
+Other tools protect agents from *external* attacks. MeMOXYDe protects agents from *themselves*.
 
 ## Stack
 
-- **Python 3** — zero external dependencies
-- **SHA256** — file integrity
-- **Content diff** — semantic contradiction detection
+- **Python 3** — zero required external dependencies
+- **SHA256** — file integrity (Layer 1)
+- **Content diff** — exact-content snapshot comparison (Layer 2)
+- **Anthropic API** — semantic claim verification, always opt-in (Layer 3)
 - **JSON** — state persistence
-- No Docker, no vector DB, no cloud. Runs anywhere Python does.
+- No Docker, no vector DB, no cloud for Layers 1–2. Runs anywhere Python does.
 
 ## Status
 
-🟢 v0.1-alpha — functional, tested on real cases
+🟢 v0.2-alpha — `verify` and `check --ai` escalation added
 
 ## License
 
-AGPL-3.0 — Free to use, modify, and share. If you build on it, you must release your changes.
+Apache 2.0 — Free to use, modify, and distribute, including in commercial products. Attribution required.
 
 ---
 

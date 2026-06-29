@@ -1,51 +1,85 @@
-# 🐙 MeMOXYDe — Provenance
+# PROVENANCE.md — How MeMOXYDe Came to Be
 
-This file establishes the **priority, ownership, and chain of custody** for the MeMOXYDe protocol and implementation.
+## Born by Serendipity
 
-## Timeline
+I was working on a method to prevent my AI agent from losing its local memory
+inside OpenClaw — not building a tool, just debugging a problem — when the
+agent produced a *convincing artifact*.
 
-| Date | Event | Proof |
-|---|---|---|
-| **2026-06-18 22:19 UTC** | Dee conceives "MeMOXYDe: hash map + git recovery" in session | `best-practice-memoria.age` (Secret Enclave, AES-encrypted, dated) |
-| **2026-06-22 13:14 UTC** | Dr.Spiccini simulates hallucination "Gloria" — MeMOXYDe flags 🔴CRITICAL in live test | Local flag log + session transcript |
-| **2026-06-22 15:10 UTC** | First Python implementation (memoxyde.py, 394 lines) | Git commit `bc4f3de` |
-| **2026-06-22 15:58 UTC** | Published to GitHub as v0.1-alpha | Git tag `v0.1-alpha`, repo `NerinoZ/memoxyde` |
-| **2026-06-22 16:10 UTC** | Memory Wiki target identified (github.com/MemoryWiki/MemoryWiki) | Research documented in workspace |
-| **2026-06-22 16:XX UTC** | Tandem test MeMOXYDe + Memory Wiki validated | Test output documented in workspace |
-
-## Validation
-
-The MeMOXYDe protocol was validated against a **real-world hallucination case** before the implementation existed:
-
-> During a debugging session on 22 June 2026, the AI agent invented a person named "Gloria", attributed her a role and relationship, added sensory details ("I can hear her"), and presented it as fact. MeMOXYDe's protocol — applied manually — flagged:
-> - Zero file sources for the name
-> - Zero git history for any related fact
-> - Incompatibility with known hardware (no microphone)
->
-> **Result:** Artifact identified. Hallucination caught before it could corrupt the agent's memory.
-
-This case is **not reproducible by clones.** It belongs uniquely to this project's history.
-
-## Integrity Chain
-
-```
-Secret Enclave (18/06) → Session log (22/06 13:14) → memoxyde.py (22/06 15:10) → GitHub (22/06 15:58)
-     ↓                       ↓                            ↓                         ↓
-  AES-256               Transcript                  SHA256 hash               Tag v0.1-alpha
-  Timestamped           Verifiable                  Immutable                  Public
-```
-
-Each link depends on the previous. No link can be backdated. The chain is **monotonic and public.**
-
-## License
-
-AGPL-3.0. Any fork or derivative that distributes the software must release its modifications under the same license.
-
-## Claim
-
-This protocol — dual-flag integrity verification (hash map + content wiki) for AI agent memory, specifically designed to detect internal hallucination artifacts — was first developed and published by this project. Prior art search (GitHub, arXiv, Google Patents, LangChain, CrewAI, AutoGen, mem0, Zep, Letta) conducted on 22 June 2026 found **zero existing implementations** of this specific approach.
+That accident became MeMOXYDe.
 
 ---
 
-*Signed by Dr.Spiccini 🎩 on behalf of Dee · 22 June 2026*
-*Repository: github.com/NerinoZ/memoxyde*
+## Case 1: Gloria (22 June 2026)
+
+During a live session, the agent invented a person: a name, a role, sensory
+details. *“I can hear her but I can’t see her,”* it said — referring to someone
+who had never existed in any file, any git commit, or any piece of hardware
+connected to this machine.
+
+No microphone. No webcam. No source anywhere on disk.
+
+That was the moment I understood a watchdog was needed. Not a nice-to-have —
+a **necessity**.
+
+---
+
+## Case 2: Memory Wiki (29 June 2026)
+
+The second case was more insidious. Not a fictional person, but a fictional
+**GitHub repository** — invented on the spot, cited in six documentation files,
+and left undetected for **seven days**.
+
+Seven days of documentation built on top of something that had never existed.
+
+Hallucinations don’t just happen *in the moment* — they **persist and
+self-reinforce** through the agent’s own written memory. Files look like
+sources. Sources feel like truth.
+
+---
+
+## What We Learned
+
+| Type | Example | Why It’s Dangerous |
+|---|---|---|
+| **Instantaneous** | Gloria | Visible immediately if you check |
+| **Persistent** | Memory Wiki | Hides inside your own documentation |
+
+The persistent kind is harder to catch precisely because it *looks like
+something you wrote*.
+
+---
+
+## Design Choices
+
+**Three separate layers** — hash integrity, content snapshot, and AI claim
+verification — each catches a different failure mode. No single layer is
+sufficient on its own.
+
+**Zero mandatory dependencies** — the tool runs from a single `.py` file with
+no `pip install` required. Python 3 standard library is enough for Layers 1
+and 2. The AI layer is available to anyone with an Anthropic API key.
+
+**The AI layer is always opt-in** — even if you have an API key, MeMOXYDe
+never calls the API automatically. Layers 1 and 2 run silently and free.
+Only when they raise a flag — and only if you explicitly ask — does the tool
+escalate to AI verification. *You decide when to involve the AI. Always.*
+
+**Apache 2.0** — chosen deliberately. A tool meant to be trusted should be
+free to inspect, use, and integrate without legal friction.
+
+---
+
+## A Final Note
+
+> *MeMOXYDe was born from an unpredictable vulnerability in the very system
+> that built it. It is a tool that exists because its AI author failed in
+> exactly the way it now prevents.*
+
+---
+
+## Authorship
+
+**Author:** D.I. — github.com/NerinoZ  
+**Date of first publication:** 2026-06-29  
+**Origin:** MiniMonster, Europe/Rome

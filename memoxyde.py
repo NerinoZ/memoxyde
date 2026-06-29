@@ -4,9 +4,14 @@
 
 Two-layer integrity shield for AI agent memory.
 Layer 1: Hash map (file signature tracking)
-Layer 2: Content wiki (content snapshot comparison)
+Layer 2: Content snapshot (exact-content comparison against last known-good state)
 
 When both flag the same file → CRITICAL: probable corruption.
+
+Opt-in Layer 3: Claim verification via AI (memoxyde verify).
+Requires ANTHROPIC_API_KEY. Checks if an agent-generated statement is:
+  GROUNDED | CONTRADICTED | UNATTESTED
+against hash-clean tracked sources.
 """
 
 import argparse
@@ -17,6 +22,7 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,8 +35,9 @@ HASHES_FILE = DATA_DIR / "hashes.json"
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 FLAGS_FILE = DATA_DIR / "flags.log"
 
-# Tracked file types by default
 DEFAULT_PATTERNS = ["*.md"]
+MAX_FILE_CHARS = 8000           # Per-file char limit for verify corpus
+DEFAULT_VERIFY_MODEL = "claude-sonnet-4-5"
 
 
 # ── Utils ───────────────────────────────────────────────────────────────────
@@ -62,8 +69,15 @@ def write_json(path: Path, data: dict):
     shutil.move(str(tmp), str(path))
 
 
-def log_flag(path: str, level: str, hash_flag: bool, wiki_flag: bool, message: str):
-    """Append a flag to the log."""
+def log_flag(
+    path: str,
+    level: str,
+    hash_flag: bool,
+    wiki_flag: bool,
+    message: str,
+    verdict: "str | None" = None,
+):
+    """Append a flag to the log. Optional verdict field for verify entries."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).isoformat()
     entry = {
@@ -74,19 +88,28 @@ def log_flag(path: str, level: str, hash_flag: bool, wiki_flag: bool, message: s
         "wiki_flag": wiki_flag,
         "message": message,
     }
+    if verdict is not None:
+        entry["verdict"] = verdict
     with open(FLAGS_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
 def col(text: str, code: str) -> str:
     """Simple ANSI coloring."""
-    colors = {"red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m", "cyan": "\033[96m", "bold": "\033[1m", "reset": "\033[0m"}
+    colors = {
+        "red": "\033[91m",
+        "green": "\033[92m",
+        "yellow": "\033[93m",
+        "cyan": "\033[96m",
+        "bold": "\033[1m",
+        "reset": "\033[0m",
+    }
     return f"{colors.get(code, '')}{text}{colors['reset']}"
 
 
 # ── Core Commands ───────────────────────────────────────────────────────────
 
-def cmd_track(paths: list[str]):
+def cmd_track(paths: list):
     """Register files for tracking. Computes initial hash + snapshot."""
     hashes = read_json(HASHES_FILE)
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -106,7 +129,6 @@ def cmd_track(paths: list[str]):
 
         hashes[rel] = {"hash": h, "timestamp": ts}
 
-        # Initial snapshot
         snap_id = hashlib.sha256(rel.encode()).hexdigest()[:12]
         snap_path = SNAPSHOTS_DIR / f"{snap_id}.snap"
         with open(path) as f:
@@ -117,11 +139,16 @@ def cmd_track(paths: list[str]):
 
         print(f"  {col('✓', 'green')} Tracked: {rel}")
 
+    # AI escalation hint
+    if flags_raised and not getattr(cmd_check, '_ai_mode', False):
+        print(f"  {col('💡 TIP:', 'cyan')} Run {col('memoxyde verify "<claim>"', 'bold')} to escalate flagged files to AI verification.")
+        print()
+
     write_json(HASHES_FILE, hashes)
     print(f"\n  {col(len(paths), 'bold')} file(s) tracked. {col(len(hashes), 'bold')} total.")
 
 
-def cmd_untrack(paths: list[str]):
+def cmd_untrack(paths: list):
     """Remove files from tracking."""
     hashes = read_json(HASHES_FILE)
     removed = 0
@@ -129,7 +156,6 @@ def cmd_untrack(paths: list[str]):
         rel = str(Path(p).resolve())
         if rel in hashes:
             del hashes[rel]
-            # Clean snapshot
             snap_id = hashlib.sha256(rel.encode()).hexdigest()[:12]
             snap_path = SNAPSHOTS_DIR / f"{snap_id}.snap"
             if snap_path.exists():
@@ -143,7 +169,7 @@ def cmd_untrack(paths: list[str]):
         print(f"\n  {col(removed, 'bold')} file(s) removed.")
 
 
-def cmd_check(paths: list[str] | None = None):
+def cmd_check(paths=None):
     """Check tracked files and produce flag matrix."""
     hashes = read_json(HASHES_FILE)
     if not hashes:
@@ -158,10 +184,9 @@ def cmd_check(paths: list[str] | None = None):
         print(f"  {col('No matching tracked files.', 'yellow')}")
         return
 
-    # Header
     print(f"\n  {'🐙 MeMOXYDe — Integrity Check':^67}")
     print(f"  {'━'*67}")
-    print(f"  {'FILE':<42} {'HASH':^10} {'WIKI':^10} {'SEVERITY':^10}")
+    print(f"  {'FILE':<42} {'HASH':^10} {'SNAPSHOT':^10} {'SEVERITY':^10}")
     print(f"  {'━'*67}")
 
     flags_raised = 0
@@ -180,12 +205,9 @@ def cmd_check(paths: list[str] | None = None):
             continue
 
         current_hash = sha256_of(path)
-
-        # Hash flag
         hash_changed = old_hash and current_hash != old_hash
-        hash_flag = hash_changed if old_hash else False  # No old hash = first check
+        hash_flag = hash_changed if old_hash else False
 
-        # Wiki flag: compare content with snapshot
         snap_id = hashlib.sha256(rel.encode()).hexdigest()[:12]
         snap_path = SNAPSHOTS_DIR / f"{snap_id}.snap"
         wiki_changed = False
@@ -194,34 +216,33 @@ def cmd_check(paths: list[str] | None = None):
                 current_content = f.read()
             with open(snap_path) as f:
                 snap_content = f.read()
-            # Strip metadata header (lines starting with # Snapshot / # Created / # hash)
-            snap_body_lines = [l for l in snap_content.split("\n") if not l.startswith("# Snapshot") and not l.startswith("# Created") and not l.startswith("# hash")]
+            snap_body_lines = [
+                l for l in snap_content.split("\n")
+                if not l.startswith("# Snapshot")
+                and not l.startswith("# Created")
+                and not l.startswith("# hash")
+            ]
             snap_body = "\n".join(snap_body_lines).strip()
             wiki_changed = snap_body != current_content.strip()
 
         wiki_flag = wiki_changed
 
-        # Matrix
         if hash_flag and wiki_flag:
             severity = "🔴CRIT"
             criticals += 1
             flags_raised += 1
-            msg = f"Hash + Wiki flag: probable corruption"
-            log_flag(rel, "CRITICAL", True, True, msg)
+            log_flag(rel, "CRITICAL", True, True, "Hash + Snapshot flag: probable corruption")
         elif hash_flag:
             severity = "🟡 WARN"
             flags_raised += 1
-            msg = "Hash changed (legitimate edit?) — update hash if intentional"
-            log_flag(rel, "WARNING", True, False, msg)
+            log_flag(rel, "WARNING", True, False, "Hash changed (legitimate edit?) — update hash if intentional")
         elif wiki_flag:
             severity = "🟡 NOTE"
             flags_raised += 1
-            msg = "Content changed but hash matches — possible contradiction"
-            log_flag(rel, "NOTE", False, True, msg)
+            log_flag(rel, "NOTE", False, True, "Content changed but hash matches — possible whitespace-only edit")
         else:
             severity = col("✅ OK", "green")
 
-        # Color by severity
         h_str = col("✅", "green") if not hash_changed else col("🔄", "yellow")
         w_str = col("✅", "green") if not wiki_changed else col("🔄", "yellow")
         if not old_hash:
@@ -229,11 +250,9 @@ def cmd_check(paths: list[str] | None = None):
             w_str = col("📌NEW", "cyan")
             severity = col("NEW", "cyan")
 
-        # Update hash if no corruption (legitimate edit)
         if hash_changed and not wiki_changed:
             hashes[rel]["hash"] = current_hash
             hashes[rel]["timestamp"] = datetime.now(timezone.utc).isoformat()
-            # Update snapshot
             with open(path) as f:
                 new_content = f.read()
             ts = datetime.now(timezone.utc).isoformat()
@@ -244,14 +263,15 @@ def cmd_check(paths: list[str] | None = None):
 
         print(f"  {rel:<42} {h_str:^10} {w_str:^10} {severity:^10}")
 
-    # Footer
     print(f"  {'━'*67}")
-    status = col("🔴 CRITICAL" if criticals else ("🟡 FLAGS" if flags_raised else "✅ CLEAN"), "red" if criticals else ("yellow" if flags_raised else "green"))
+    status = col(
+        "🔴 CRITICAL" if criticals else ("🟡 FLAGS" if flags_raised else "✅ CLEAN"),
+        "red" if criticals else ("yellow" if flags_raised else "green"),
+    )
     path_count = len(to_check)
     print(f"  {path_count} files · {col(flags_raised, 'bold')} flag(s) · {col(criticals, 'bold')} critical(s)  Status: {status}")
     print()
 
-    # Save updated hashes if we auto-updated
     write_json(HASHES_FILE, hashes)
 
 
@@ -290,10 +310,11 @@ def cmd_log(lines: int = 20):
     print(f"\n  {'🐙 MeMOXYDe — Last Flags':^67}")
     print(f"  {'━'*67}")
     for e in entries[-lines:]:
-        ts = e["timestamp"][:19]  # trim tz
+        ts = e["timestamp"][:19]
         path = e["path"][:40]
         lvl = e["level"]
-        print(f"  {ts} | {lvl:<10} | {e['hash_flag']} {e['wiki_flag']} | {path}")
+        verdict_str = f" → {e['verdict']}" if "verdict" in e else ""
+        print(f"  {ts} | {lvl:<18} | {e['hash_flag']} {e['wiki_flag']} | {path}{verdict_str}")
     print(f"  {'━'*67}")
     print()
 
@@ -314,7 +335,6 @@ def cmd_self_test():
     print(f"\n  {'🐙 MeMOXYDe — Self-Test':^67}")
     print(f"  {'━'*67}")
 
-    # Use MEMORY.md and USER.md as test subjects
     test_files = []
     for f in ["MEMORY.md", "USER.md", "SOUL.md"]:
         p = Path.home() / ".openclaw" / "workspace" / f
@@ -328,14 +348,264 @@ def cmd_self_test():
     print(f"  Test files: {len(test_files)}")
     print()
 
-    # Track
     cmd_track(test_files)
-
-    # Check
     cmd_check()
 
     print(f"  {col('Self-test complete.', 'green')}")
 
+
+# ── Claim Verification Layer (opt-in, requires ANTHROPIC_API_KEY) ────────────
+
+_VERIFY_SYSTEM_PROMPT = (
+    "Sei un verificatore di claim. Ti viene fornito un insieme di documenti "
+    "(fonte di verita, hash-verificati) e un'affermazione da controllare.\n"
+    'Rispondi SOLO con un oggetto JSON: {"verdict": "GROUNDED"|"CONTRADICTED"|"UNATTESTED", '
+    '"evidence": "<citazione breve o nota di assenza>", "confidence": "high"|"medium"|"low"}\n'
+    "- GROUNDED: l'affermazione e esplicitamente supportata da almeno un documento.\n"
+    "- CONTRADICTED: almeno un documento afferma esplicitamente il contrario.\n"
+    "- UNATTESTED: nessun documento conferma ne contraddice l'affermazione.\n"
+    "Non inventare fonti. Se il claim non e verificabile con i documenti forniti, usa UNATTESTED."
+)
+
+
+def _call_anthropic_verify(claim: str, sources: dict, model: str) -> dict:
+    """
+    Call Anthropic Messages API to classify a claim against source documents.
+    Uses SDK if available, falls back to stdlib urllib.
+    Returns dict with keys: verdict, evidence, confidence.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise ValueError(
+            "ANTHROPIC_API_KEY not set.\n"
+            "  Export it first: export ANTHROPIC_API_KEY=sk-ant-..."
+        )
+
+    corpus_parts = []
+    for path, content in sources.items():
+        corpus_parts.append(f"=== FILE: {path} ===\n{content}\n")
+    corpus = "\n".join(corpus_parts)
+
+    user_message = f"DOCUMENTI:\n{corpus}\n\nCLAIM DA VERIFICARE:\n\"{claim}\""
+
+    raw = None
+
+    # Try official SDK first (optional dependency)
+    try:
+        import anthropic  # type: ignore
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model=model,
+            max_tokens=256,
+            system=_VERIFY_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        raw = msg.content[0].text.strip()
+    except ImportError:
+        pass  # Fall through to urllib
+
+    # urllib fallback (zero extra deps)
+    if raw is None:
+        payload = json.dumps(
+            {
+                "model": model,
+                "max_tokens": 256,
+                "system": _VERIFY_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": user_message}],
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"API HTTP {e.code}: {body[:200]}") from e
+        raw = data["content"][0]["text"].strip()
+
+    # Strip markdown code fences if model wraps JSON
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:-1]).strip() if len(lines) > 2 else raw
+
+    result = json.loads(raw)
+    return result
+
+
+def cmd_verify(claim: str, model: str = DEFAULT_VERIFY_MODEL):
+    """
+    Verify a claim against hash-clean tracked files via Anthropic API.
+    Requires ANTHROPIC_API_KEY environment variable.
+    """
+    # Quick pre-flight: API key
+    if not os.environ.get("ANTHROPIC_API_KEY", ""):
+        print(f"  {col('✗ ANTHROPIC_API_KEY not set.', 'red')}")
+        print(f"  {col('  Export it first: export ANTHROPIC_API_KEY=sk-ant-...', 'yellow')}")
+        sys.exit(1)
+
+    hashes = read_json(HASHES_FILE)
+    if not hashes:
+        print(f"  {col('No files tracked.', 'yellow')} Run \'track\' first.")
+        sys.exit(1)
+
+    # Collect only hash-clean files
+    sources = {}
+    skipped = []
+    truncated = []
+
+    for rel, data in hashes.items():
+        path = Path(rel)
+        if not path.exists():
+            skipped.append(f"{Path(rel).name} (missing)")
+            continue
+        current_hash = sha256_of(path)
+        if current_hash != data.get("hash", ""):
+            skipped.append(f"{Path(rel).name} (hash dirty — excluded for safety)")
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            skipped.append(f"{Path(rel).name} (read error: {e})")
+            continue
+        if len(content) > MAX_FILE_CHARS:
+            content = content[:MAX_FILE_CHARS] + f"\n... [TRUNCATED at {MAX_FILE_CHARS} chars]"
+            truncated.append(Path(rel).name)
+        sources[rel] = content
+
+    if not sources:
+        print(f"  {col('No clean files available for verification.', 'yellow')}")
+        print(f"  Run \'memoxyde check\' to update hashes first.")
+        sys.exit(1)
+
+    # ── Output Header ──
+    print(f"\n  {'🐙 MeMOXYDe — Claim Verification':^67}")
+    print(f"  {'━'*67}")
+    print(f"  CLAIM: {col(repr(claim), 'bold')}")
+    print(f"  {'━'*67}")
+    file_names = [Path(p).name for p in sources]
+    print(f"  Sources checked : {len(sources)} file(s) ({', '.join(file_names)})")
+    if truncated:
+        print(f"  {col('⚠  Truncated     :', 'yellow')} {', '.join(truncated)} (>{MAX_FILE_CHARS} chars)")
+    for s in skipped:
+        print(f"  {col('⚠  Skipped        :', 'yellow')} {s}")
+    print(f"  Model           : {col(model, 'cyan')}")
+    print()
+    print(f"  {col('Verifying...', 'cyan')}", flush=True)
+
+    try:
+        result = _call_anthropic_verify(claim, sources, model)
+    except ValueError as e:
+        print(f"  {col(f'✗ {e}', 'red')}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"  {col(f'✗ API error: {e}', 'red')}")
+        sys.exit(1)
+
+    verdict = result.get("verdict", "UNATTESTED").upper().strip()
+    evidence = result.get("evidence", "—")
+    confidence = result.get("confidence", "low")
+
+    # Sanitise verdict — never let free text leak into level field
+    if verdict not in ("GROUNDED", "CONTRADICTED", "UNATTESTED"):
+        evidence = f"[Non-standard verdict normalised: {verdict}] {evidence}"
+        verdict = "UNATTESTED"
+
+    verdict_display = {
+        "GROUNDED": col("✅  GROUNDED", "green"),
+        "CONTRADICTED": col("🔴 CONTRADICTED", "red"),
+        "UNATTESTED": col("⚠️   UNATTESTED", "yellow"),
+    }[verdict]
+
+    print(f"  {'━'*67}")
+    print(f"  Verdict    : {verdict_display}")
+    print(f"  Evidence   : {evidence}")
+    print(f"  Confidence : {confidence}")
+    print(f"  {'━'*67}")
+    print()
+
+    # Log entry
+    log_flag(
+        path=f"[verify] {claim[:80]}",
+        level=f"VERIFY:{verdict}",
+        hash_flag=False,
+        wiki_flag=False,
+        message=f"model={model} confidence={confidence} evidence={evidence[:120]}",
+        verdict=verdict,
+    )
+
+
+
+
+def cmd_check_ai(paths=None):
+    """
+    Run check (Layer 1+2) then optionally escalate to AI verify (Layer 3).
+    Never calls AI without explicit user confirmation.
+    """
+    cmd_check._ai_mode = True  # suppress tip, we handle escalation ourselves
+    cmd_check(paths)
+    cmd_check._ai_mode = False
+
+    hashes = read_json(HASHES_FILE)
+    # Check if any flags exist in recent log
+    flagged = False
+    if FLAGS_FILE.exists():
+        with open(FLAGS_FILE) as f:
+            lines = [l for l in f if l.strip()]
+        if lines:
+            try:
+                last = [json.loads(l) for l in lines[-5:]]
+                flagged = any(
+                    e.get("level") in ("CRITICAL", "WARNING", "NOTE", "ERROR")
+                    and not e.get("level", "").startswith("VERIFY")
+                    for e in last
+                )
+            except Exception:
+                pass
+
+    if not flagged:
+        print(f"  {col('✅ No flags — AI escalation not needed.', 'green')}")
+        print()
+        return
+
+    if not os.environ.get("ANTHROPIC_API_KEY", ""):
+        print(f"  {col('⚠ ANTHROPIC_API_KEY not set — cannot escalate to AI layer.', 'yellow')}")
+        print()
+        return
+
+    print(f"  {col('─'*67, 'yellow')}")
+    print(f"  {col('⚠ Flags detected.', 'yellow')} Escalate to AI verification layer? [y/N] ", end="", flush=True)
+    try:
+        answer = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if answer != "y":
+        print(f"  Skipped. You can run {col('memoxyde verify "<claim>"', 'bold')} manually later.")
+        print()
+        return
+
+    print(f"  Enter the claim to verify: ", end="", flush=True)
+    try:
+        claim = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if not claim:
+        print(f"  {col('Empty claim — skipped.', 'yellow')}")
+        return
+
+    print()
+    cmd_verify(claim)
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -347,13 +617,16 @@ def main():
 Examples:
   %(prog)s track MEMORY.md USER.md      Start tracking files
   %(prog)s check                         Check all tracked files
+  %(prog)s check --ai                    Check + offer AI escalation if flags found
   %(prog)s check MEMORY.md               Check specific file
   %(prog)s status                        Show tracked files
   %(prog)s log                           Show recent flags
   %(prog)s untrack MEMORY.md             Stop tracking
   %(prog)s self-test                     Run demo on workspace
   %(prog)s reset                         Clear all tracking data
-"""
+  %(prog)s verify "claim text"           Verify a claim against tracked files (AI)
+  %(prog)s verify "claim" --model haiku  Use Haiku (faster, cheaper)
+""",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -364,8 +637,13 @@ Examples:
     p_untrack = sub.add_parser("untrack", help="Remove files from tracking")
     p_untrack.add_argument("paths", nargs="+", help="Files to untrack")
 
-    p_check = sub.add_parser("check", help="Check file integrity (hash + wiki)")
+    p_check = sub.add_parser("check", help="Check file integrity (hash + snapshot)")
     p_check.add_argument("paths", nargs="*", help="Optional: check only these files")
+    p_check.add_argument(
+        "--ai",
+        action="store_true",
+        help="After check, offer AI escalation (Layer 3) if flags are found (requires ANTHROPIC_API_KEY)",
+    )
 
     sub.add_parser("status", help="Show tracked files")
 
@@ -375,16 +653,47 @@ Examples:
     sub.add_parser("reset", help="Clear all tracking data")
     sub.add_parser("self-test", help="Run demo on workspace")
 
+    p_verify = sub.add_parser(
+        "verify",
+        help="Verify a claim against hash-clean tracked files (requires ANTHROPIC_API_KEY)",
+    )
+    p_verify.add_argument("claim", help="The statement/claim to verify")
+    p_verify.add_argument(
+        "--model",
+        default=DEFAULT_VERIFY_MODEL,
+        metavar="MODEL",
+        help=(
+            f"Anthropic model to use (default: {DEFAULT_VERIFY_MODEL}). "
+            "Aliases: 'haiku' → claude-haiku-4-5, "
+            "'sonnet' → claude-sonnet-4-5"
+        ),
+    )
+
     args = parser.parse_args()
+
+    # Resolve model aliases for verify
+    model_aliases = {
+        "haiku": "claude-haiku-4-5",
+        "sonnet": "claude-sonnet-4-5",
+        "opus": "claude-opus-4-5",
+    }
 
     cmds = {
         "track": lambda: cmd_track(args.paths),
         "untrack": lambda: cmd_untrack(args.paths),
-        "check": lambda: cmd_check(args.paths if args.paths else None),
+        "check": lambda: (
+            cmd_check_ai(args.paths if args.paths else None)
+            if getattr(args, "ai", False)
+            else cmd_check(args.paths if args.paths else None)
+        ),
         "status": cmd_status,
         "log": lambda: cmd_log(args.n),
         "reset": cmd_reset,
         "self-test": cmd_self_test,
+        "verify": lambda: cmd_verify(
+            args.claim,
+            model_aliases.get(args.model, args.model),
+        ),
     }
 
     cmds.get(args.command, lambda: parser.print_help())()
