@@ -161,4 +161,4 @@ Apache 2.0 — Free to use, modify, and distribute, including in commercial prod
 
 ---
 
-*Built with 🎩 by Dr.Spiccini*
+*Built with 🎩 Dr.Spiccini*
